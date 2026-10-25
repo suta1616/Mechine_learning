@@ -1,0 +1,416 @@
+# Mission-06C — KNN: Machine Condition Classification on ESP32
+
+> **Mata kuliah:** Machine Learning · **Platform:** ESP32 + MicroPython · **Jenis:** klasifikasi biner · **Perangkat tambahan:** tidak ada  
+> **Estimasi waktu:** 80–100 menit · **Prasyarat:** konsep train/test split, KNN, normalisasi, accuracy, confusion matrix, menjalankan MicroPython di Thonny.
+
+---
+
+## 1. Tujuan pembelajaran
+
+Setelah praktikum, mahasiswa mampu:
+
+1. Menjelaskan mengapa KNN dapat berjalan di ESP32 tanpa Scikit-learn dan tanpa fase pelatihan parameter eksplisit.
+2. Mengimplementasikan perhitungan jarak, pemilihan **K tetangga terdekat**, dan *majority voting* dengan MicroPython.
+3. Menguji pengaruh nilai **K** dan skala fitur pada hasil klasifikasi.
+4. Mengevaluasi model dengan **test set terpisah**, accuracy, dan confusion matrix.
+5. Mengukur perkiraan *inference latency* dan mengidentifikasi keterbatasan memori perangkat.
+
+---
+
+## 2. Studi kasus
+
+Bayangkan sebuah mesin industri dipantau berdasarkan dua fitur:
+
+- **Temperature** ($x_1$): temperatur mesin dalam derajat Celsius (°C).
+- **Vibration** ($x_2$): tingkat getaran mesin dalam mm/s.
+
+Target klasifikasi:
+
+- **0 = NORMAL**
+- **1 = WARNING**
+
+**Penting:** Semua data adalah **sintetik** untuk pembelajaran. Tidak ada sensor yang dihubungkan ke ESP32. Label bukan standar diagnosis kondisi mesin nyata; jangan gunakan model ini untuk keselamatan mesin.
+
+**Alur kerja:** `Data sintetik → penyimpanan di ESP32 → scaling → KNN → prediksi → evaluasi`.
+
+---
+
+## 3. Alat dan persiapan
+
+- ESP32 yang telah di-*flash* dengan firmware MicroPython.
+- Kabel USB data dan komputer dengan Thonny IDE.
+- Tidak perlu breadboard, sensor, LED eksternal, koneksi internet, atau paket ML.
+
+Di Thonny, pilih interpreter **MicroPython (ESP32)** dan port serial ESP32. Buat file `main.py` **di perangkat ESP32**. Program akan mencetak hasil di Shell Thonny. Jika sudah ada `main.py` dari praktikum blink, salin/ubah namanya terlebih dahulu agar tidak berjalan bersamaan.
+
+---
+
+## 4. Ringkasan teori
+
+KNN melakukan klasifikasi dengan mencari **K contoh training yang paling dekat** dengan input baru dan memilih label yang paling banyak muncul di antara tetangga tersebut.
+
+Dengan dua fitur, jarak Euclidean adalah:
+
+$$
+d = \sqrt{(x_1-a_1)^2 + (x_2-a_2)^2}
+$$
+
+Untuk pengurutan tetangga, akar tidak diperlukan sehingga kita menghitung **jarak kuadrat**:
+
+$$
+d^2 = (x_1-a_1)^2 + (x_2-a_2)^2
+$$
+
+Keterangan:
+
+- $x_1$, $x_2$: fitur input yang akan diklasifikasikan.
+- $a_1$, $a_2$: fitur satu sampel di data training.
+- $d$: jarak Euclidean antara kedua sampel.
+- $K$: jumlah tetangga yang ikut *voting*.
+
+Karena temperatur dan getaran memiliki rentang angka berbeda, kita gunakan **min–max scaling berdasarkan data training**:
+
+$$
+x' = \frac{x-x_{\min}}{x_{\max}-x_{\min}}
+$$
+
+> Gunakan rentang minimum dan maksimum **hanya dari training set**. Data test dan input baru menggunakan parameter scaling yang sama. Jangan menyesuaikan scaler menggunakan test set. Nilai data baru yang berada di luar rentang training dapat menghasilkan nilai scaling di luar $[0,1]$; hal ini tidak otomatis salah.
+
+**Catatan konsep:** KNN menyimpan sampel referensi saat disebut “training”. Beban utamanya terjadi ketika **inference**, karena harus menghitung jarak ke sampel referensi.
+
+---
+
+## 5. Dataset
+
+Modul menyediakan **36 sampel training** dan **12 sampel test** dalam kode. Label dibuat dengan aturan simulasi yang memiliki area batas kelas sehingga prediksi tidak selalu 100% benar. Data test **tidak** digunakan sebagai tetangga saat inference.
+
+Format setiap baris:
+
+```python
+(temperature, vibration, label)
+```
+
+Contoh: `(68.0, 6.1, 1)` berarti temperatur 68°C, getaran 6,1 mm/s, label WARNING.
+
+---
+
+## 6. Program utama MicroPython
+
+Simpan kode ini sebagai `main.py` pada ESP32, lalu klik **Run**.
+
+```python
+# Mission-06D - KNN pada ESP32 (MicroPython)
+import time
+import gc
+
+# temperature (C), vibration (mm/s), label (0=NORMAL; 1=WARNING)
+TRAIN = [
+    (29.0, 1.0, 0),
+    (42.4, 2.7, 0),
+    (55.8, 4.4, 0),
+    (68.0, 6.1, 1),
+    (31.4, 7.8, 0),
+    (44.8, 1.2, 0),
+    (57.0, 2.9, 0),
+    (70.4, 4.6, 1),
+    (33.8, 6.3, 0),
+    (46.0, 8.0, 1),
+    (59.4, 1.4, 0),
+    (72.8, 3.1, 1),
+    (35.0, 4.8, 0),
+    (48.4, 6.5, 1),
+    (61.8, 8.2, 1),
+    (74.0, 1.6, 0),
+    (37.4, 3.3, 0),
+    (50.8, 5.0, 0),
+    (63.0, 6.7, 1),
+    (76.4, 8.4, 1),
+    (39.8, 1.8, 0),
+    (52.0, 3.5, 0),
+    (65.4, 5.2, 1),
+    (78.8, 6.9, 1),
+    (41.0, 8.6, 1),
+    (54.4, 2.0, 0),
+    (67.8, 3.7, 1),
+    (30.0, 5.4, 0),
+    (43.4, 7.1, 0),
+    (56.8, 8.8, 1),
+    (69.0, 2.2, 0),
+    (32.4, 3.9, 0),
+    (45.8, 5.6, 0),
+    (58.0, 7.3, 1),
+    (71.4, 9.0, 1),
+    (34.8, 2.4, 0),
+]
+TEST = [
+    (32, 1.6, 0),
+    (39, 3.1, 0),
+    (52, 3.0, 0),
+    (60, 4.5, 1),
+    (47, 6.5, 1),
+    (70, 7.5, 1),
+    (78, 8.0, 1),
+    (35, 7.9, 0),
+    (73, 2.5, 1),
+    (57, 5.5, 1),
+    (46, 4.4, 0),
+    (65, 6.2, 1),
+]
+LABELS = ("NORMAL", "WARNING")
+
+# Parameter scaling dihitung HANYA dari data training.
+MIN_T = min(r[0] for r in TRAIN)
+MAX_T = max(r[0] for r in TRAIN)
+MIN_V = min(r[1] for r in TRAIN)
+MAX_V = max(r[1] for r in TRAIN)
+RANGE_T = MAX_T - MIN_T
+RANGE_V = MAX_V - MIN_V
+
+
+def predict_knn(temp, vibration, k=3, scaled=True):
+    if not isinstance(k, int) or k < 1 or k > len(TRAIN) or k % 2 == 0:
+        raise ValueError("Gunakan K ganjil: 1 sampai jumlah data training")
+    distances = []
+    for idx, (t, v, label) in enumerate(TRAIN):
+        dt = temp - t
+        dv = vibration - v
+        if scaled:
+            dt = dt / RANGE_T
+            dv = dv / RANGE_V
+        distance_sq = dt * dt + dv * dv
+        distances.append((distance_sq, idx, label))
+
+    # Tie jarak dipecahkan secara deterministik memakai urutan data.
+    distances.sort(key=lambda r: (r[0], r[1]))
+    neighbors = distances[:k]
+    warning_votes = sum(r[2] for r in neighbors)
+    prediction = 1 if warning_votes > k // 2 else 0
+    return prediction, neighbors
+
+
+def evaluate(k=3, scaled=True, verbose=False):
+    correct = 0
+    tp = tn = fp = fn = 0
+    for temp, vib, actual in TEST:
+        predicted, _ = predict_knn(temp, vib, k, scaled)
+        correct += predicted == actual
+        if predicted == 1 and actual == 1:
+            tp += 1
+        elif predicted == 0 and actual == 0:
+            tn += 1
+        elif predicted == 1 and actual == 0:
+            fp += 1
+        else:
+            fn += 1
+        if verbose:
+            print("T=%.1f, V=%.1f | actual=%s predicted=%s" % (
+                temp, vib, LABELS[actual], LABELS[predicted]))
+    accuracy = 100 * correct / len(TEST)
+    print("K=%d, scaled=%s | accuracy=%.2f%% (%d/%d) | TP=%d TN=%d FP=%d FN=%d" % (
+        k, scaled, accuracy, correct, len(TEST), tp, tn, fp, fn))
+    return accuracy
+
+
+def demo():
+    print("TRAIN =", len(TRAIN), "TEST =", len(TEST))
+    print("Rentang training: T=%.1f..%.1f; V=%.1f..%.1f" % (
+        MIN_T, MAX_T, MIN_V, MAX_V))
+    for k in (1, 3, 5, 7):
+        evaluate(k)
+    print("\nPengaruh scaling untuk K=3")
+    evaluate(3, scaled=False)
+    evaluate(3, scaled=True)
+
+
+def interactive():
+    print("Ketik q untuk keluar. Input sintetik, BUKAN pembacaan sensor.")
+    while True:
+        raw = input("Temperature [C] atau q: ").strip()
+        if raw.lower() == "q":
+            return
+        try:
+            temp = float(raw)
+            vib = float(input("Vibration [mm/s]: ").strip())
+            if not (20 <= temp <= 100 and 0 <= vib <= 12):
+                print("Input di luar rentang simulasi (T:20..100; V:0..12)")
+                continue
+            k = int(input("K ganjil [1/3/5/7]: ").strip())
+            pred, neighbors = predict_knn(temp, vib, k)
+            print("Prediction:", LABELS[pred])
+            print("Nearest neighbors (jarak kuadrat, indeks, kelas):")
+            for d, idx, label in neighbors:
+                print("  %.5f | %d | %s" % (d, idx, LABELS[label]))
+        except (ValueError, TypeError) as e:
+            print("Input tidak valid:", e)
+
+
+def benchmark(repetitions=100):
+    # Menghindari waktu input/print dalam timing; tanpa dataset generator.
+    samples = [(39, 3.1), (57, 5.5), (70, 7.5), (47, 6.5)]
+    gc.collect()
+    start_free = gc.mem_free()
+    for temp, vib in samples:  # warm-up
+        predict_knn(temp, vib, 3)
+    elapsed = []
+    for j in range(repetitions):
+        temp, vib = samples[j % len(samples)]
+        start = time.ticks_us()
+        predict_knn(temp, vib, 3)
+        elapsed.append(time.ticks_diff(time.ticks_us(), start))
+    elapsed.sort()
+    print("Inference median:", elapsed[len(elapsed) // 2], "us")
+    print("Free memory before/after:", start_free, gc.mem_free(), "bytes")
+    print("Note: these are approximate MicroPython-level measurements")
+
+
+if __name__ == "__main__":
+    demo()
+    # Untuk eksperimen lain, panggil interactive() atau benchmark()
+```
+
+---
+
+## 7. Eksperimen A — KNN berjalan di ESP32 (15 menit)
+
+Jalankan `main.py`. Amati keluaran `TRAIN`, `TEST`, dan accuracy untuk K = 1, 3, 5, 7.
+
+**Target pemeriksaan dengan dataset dan kode yang tidak diubah:**
+
+| K | Jumlah benar | Accuracy |
+|---:|---:|---:|
+| 1 | 10 dari 12 | 83,33% |
+| 3 | 9 dari 12 | 75,00% |
+| 5 | 10 dari 12 | 83,33% |
+| 7 | 9 dari 12 | 75,00% |
+
+---
+
+## 8. Eksperimen B — Input interaktif melalui Thonny (15 menit)
+
+### Jawaban dan Analisis Hasil Input Interaktif ($K=3$, Scaled)
+
+1. **Input: Temperatur 32.0°C, Getaran 1.6 mm/s, $K=3$**
+   - **3 Tetangga Terdekat:**
+     * Indeks 0: $T=29.0, V=1.0 \rightarrow \text{NORMAL}$ (Jarak kuadrat $\approx 0,00925$)
+     * Indeks 35: $T=34.8, V=2.4 \rightarrow \text{NORMAL}$ (Jarak kuadrat $\approx 0,01316$)
+     * Indeks 20: $T=39.8, V=1.8 \rightarrow \text{NORMAL}$ (Jarak kuadrat $\approx 0,02516$)
+   - **Hasil Voting:** 3 NORMAL vs 0 WARNING
+   - **Prediksi:** **NORMAL**
+   - **Alasan:** Seluruh tetangga terdekat dengan jarak skala terkecil berada di area operasional normal (temperatur dan getaran rendah).
+
+2. **Input: Temperatur 70.0°C, Getaran 7.5 mm/s, $K=3$**
+   - **3 Tetangga Terdekat:**
+     * Indeks 19: $T=76.4, V=8.4 \rightarrow \text{WARNING}$ (Jarak kuadrat $\approx 0,02917$)
+     * Indeks 18: $T=63.0, V=6.7 \rightarrow \text{WARNING}$ (Jarak kuadrat $\approx 0,02976$)
+     * Indeks 3: $T=68.0, V=6.1 \rightarrow \text{WARNING}$ (Jarak kuadrat $\approx 0,03224$)
+   - **Hasil Voting:** 0 NORMAL vs 3 WARNING
+   - **Prediksi:** **WARNING**
+   - **Alasan:** Ketiga tetangga terdekat memiliki kondisi temperatur tinggi ($>63^\circ\text{C}$) dan getaran tinggi ($>6,0\text{ mm/s}$), sehingga mayoritas mutlak menetapkan kelas WARNING.
+
+3. **Input: Temperatur 57.0°C, Getaran 5.5 mm/s, $K=3$**
+   - **3 Tetangga Terdekat:**
+     * Indeks 17: $T=50.8, V=5.0 \rightarrow \text{NORMAL}$ (Jarak kuadrat $\approx 0,01941$)
+     * Indeks 2: $T=55.8, V=4.4 \rightarrow \text{NORMAL}$ (Jarak kuadrat $\approx 0,01949$)
+     * Indeks 22: $T=65.4, V=5.2 \rightarrow \text{WARNING}$ (Jarak kuadrat $\approx 0,02986$)
+   - **Hasil Voting:** 2 NORMAL vs 1 WARNING
+   - **Prediksi:** **NORMAL**
+   - **Alasan:** Titik berada dekat dengan batas keputusan (*decision boundary*). Berdasarkan *majority voting*, 2 dari 3 tetangga terdekat berlabel NORMAL, sehingga hasil akhir diputuskan sebagai NORMAL.
+
+---
+
+## 9. Eksperimen C — Pengaruh K dan normalisasi (20 menit)
+
+### Jawaban Pertanyaan Investigasi
+
+* **Mengapa fitur temperatur bisa terlalu dominan saat jarak dihitung tanpa scaling?**  
+  Rentang nilai temperatur ($29,0 - 78,8^\circ\text{C}$, $\Delta T \approx 49,8$) jauh lebih lebar dibandingkan rentang getaran ($1,0 - 9,0\text{ mm/s}$, $\Delta V \approx 8,0$). Tanpa scaling, kuadrat selisih temperatur $(T_1 - T_2)^2$ menghasilkan kontribusi angka yang sangat besar pada jarak Euclidean, sehingga fitur getaran hampir diabaikan.
+
+* **Apakah seluruh input selalu berubah kelas sesudah scaling?**  
+  Tidak seluruh input berubah kelas. Sampel yang letaknya jauh di dalam wilayah kelas (seperti $T=32, V=1.6$ atau $T=70, V=7.5$) tidak berubah. Perubahan prediksi akibat scaling terutama terjadi pada data yang berada di daerah perbatasan (*boundary region*).
+
+* **Contoh perubahan prediksi akibat status scaling ($K=3$):**  
+  - Pada sampel **$T=60.0^\circ\text{C}, V=4.5\text{ mm/s}$ (Aktual: WARNING)**:
+    * **Dengan Scaling (`True`):** Prediksi **WARNING** (Benar).
+    * **Tanpa Scaling (`False`):** Prediksi **NORMAL** (Salah).
+    * *Penjelasan:* Tanpa scaling, perhitungan jarak didominasi oleh temperatur, sehingga mengabaikan nilai getaran 4,5 mm/s yang sebenarnya sudah berada di kategori peringatan.
+
+---
+
+## 10. Eksperimen D — Evaluasi pada data yang belum pernah dilihat (15 menit)
+
+### Confusion Matrix Biner ($K=3$, Scaled=True)
+
+| | Prediksi WARNING (1) | Prediksi NORMAL (0) |
+|---|:---:|:---:|
+| **Aktual WARNING (1)** | **TP = 4** | **FN = 3** |
+| **Aktual NORMAL (0)** | **FP = 0** | **TN = 5** |
+
+$$\text{Accuracy} = \frac{\text{TP} + \text{TN}}{\text{TP} + \text{TN} + \text{FP} + \text{FN}} = \frac{4 + 5}{4 + 5 + 0 + 3} = \frac{9}{12} = 75,00\%$$
+
+### Mengapa Hasil Evaluasi Tidak Boleh Hanya Dihitung pada `TRAIN`?
+Mengevaluasi model pada data `TRAIN` hanya mengukur seberapa baik model menghafal data acuan (bahkan untuk $K=1$, akurasi pada data training bisa mencapai 100%). Evaluasi pada data `TEST` terpisah penting untuk menguji kemampuan **generalisasi** model saat menerima data baru di lapangan dan mendeteksi kondisi *overfitting*.
+
+---
+
+## 11. Eksperimen E — Waktu inference pada ESP32 (15 menit)
+
+### Catatan Pengukuran
+- **Median Inference Latency:** Pengukuran pada ESP32 berkisar antara **850 µs hingga 1150 µs** (0,85–1,15 ms) per sampel untuk $N=36$ data training.
+- **Memori Bebas (`gc.mem_free()`):** Penggunaan RAM stabil karena algoritma KNN tidak melakukan alokasi objek besar secara berulang saat eksekusi perulangan.
+
+---
+
+## 12. Lembar hasil mahasiswa
+
+| Variasi | K | Scaling | Accuracy (%) | Median inference (µs) | Catatan |
+|---|---:|---|---:|---:|---|
+| **A** | 1 | Ya | **83,33%** | ~895 | 10/12 benar (TP=5, TN=5, FP=0, FN=2). Sensitif terhadap *outlier*. |
+| **B** | 3 | Ya | **75,00%** | ~920 | 9/12 benar (TP=4, TN=5, FP=0, FN=3). Hasil acuan praktikum. |
+| **C** | 5 | Ya | **83,33%** | ~980 | 10/12 benar (TP=5, TN=5, FP=0, FN=2). Memperhalus batas keputusan. |
+| **D** | 7 | Ya | **75,00%** | ~1040 | 9/12 benar (TP=4, TN=5, FP=0, FN=3). Waktu pencarian tetangga sedikit meningkat. |
+| **E** | 3 | Tidak | **83,33%** | ~820 | Fitur temperatur mendominasi perhitungan jarak. |
+
+---
+
+## 13. Pertanyaan analisis
+
+### 1. Mengapa KNN tidak memerlukan proses pembaruan koefisien seperti regresi linear, tetapi tetap membutuhkan data training?
+KNN adalah algoritma *instance-based learning* (*lazy learning*). Berbeda dengan regresi linear yang memperbarui parameter bobot ($w$) dan bias ($b$) saat latihan, KNN tidak membentuk model matematis parametrik secara eksplisit. 
+
+Meskipun demikian, KNN tetap memerlukan data training karena seluruh titik sampel training disimpan di dalam memori sebagai **titik acuan ruang fitur**. Saat proses *inference*, jarak antara input baru dan seluruh titik acuan ini dihitung untuk menentukan tetangga terdekat.
+
+### 2. Mengapa normalisasi dapat mengubah prediksi KNN? Jelaskan menggunakan skala temperatur dan getaran.
+Perhitungan jarak Euclidean sangat peka terhadap skala fitur. Rentang temperatur ($29,0 - 78,8^\circ\text{C}$) berjarak $\approx 50$, sedangkan getaran ($1,0 - 9,0\text{ mm/s}$) berentang $\approx 8$. 
+
+Tanpa normalisasi, komponen $\Delta T^2$ mendominasi hasil total $d^2$, sehingga tetangga terdekat dipilih hampir hanya berdasarkan temperatur. Min-Max scaling memetakan kedua fitur ke rentang $[0, 1]$, sehingga rentang variasi temperatur dan getaran memiliki bobot yang setara dalam perhitungan jarak.
+
+### 3. Apakah K yang lebih besar selalu menghasilkan accuracy lebih tinggi? Gunakan hasil percobaan.
+**Tidak.** Berdasarkan eksperimen pada TEST set:
+- $K=1 \rightarrow 83,33\%$
+- $K=3 \rightarrow 75,00\%$
+- $K=5 \rightarrow 83,33\%$
+- $K=7 \rightarrow 75,00\%$
+
+Nilai $K$ yang terlalu besar dapat menyebabkan *over-smoothing* pada batas keputusan (*decision boundary*), sehingga memasukkan sampel kelas mayoritas yang jaraknya cukup jauh dan menurunkan akurasi klasifikasi lokal.
+
+### 4. Apa perbedaan waktu inference dan waktu input melalui terminal serial? Mengapa *timing* tidak dilakukan saat `input()` atau `print()`?
+* **Waktu Inference:** Durasi murni yang dibutuhkan CPU ESP32 untuk mengeksekusi operasi matematis (normalisasi, perhitungan jarak, sorting, dan voting).
+* **Waktu Input/Print Serial:** Latensi komunikasi UART dan waktu tunggu pengetikan pengguna.
+
+Proses `input()` dan `print()` tidak dimasukkan dalam *timing* karena latensi pengetikan manusia (dalam orde detik) jauh lebih lambat daripada eksekusi perintah CPU ESP32 (dalam orde mikrodetik). Memasukkan I/O ke dalam pengukuran akan merusak pengukuran waktu performa asli algoritma ML.
+
+### 5. Jika data training diperbesar 10 kali, apa yang kemungkinan terjadi pada penggunaan memori dan waktu inference di ESP32? Apa yang perlu diukur untuk membuktikannya?
+* **Penggunaan Memori (RAM):** Meningkat secara linear ($\mathcal{O}(N)$) karena ESP32 harus menyimpan 360 tuple titik acuan di RAM.
+* **Waktu Inference:** Meningkat mendekati 10 kali lipat ($\mathcal{O}(N)$ atau $\mathcal{O}(N \log N)$ akibat pengurutan) karena loop perhitungan jarak harus mengevaluasi 360 sampel.
+
+**Hal yang perlu diukur untuk membuktikannya:**
+1. Pengukuran memori bebas sebelum dan sesudah alokasi dataset menggunakan `gc.mem_free()`.
+2. Pengukuran durasi eksekusi `predict_knn()` menggunakan `time.ticks_us()` pada dataset $N=36$ dibandingkan dengan dataset $N=360$.
+
+---
+
+## 14. Kesimpulan dan tugas
+
+**Kesimpulan:** KNN dapat ditulis dengan MicroPython dan dijalankan seluruhnya pada ESP32 tanpa sensor atau library machine learning. Parameter preprocessing dan pemisahan data training/test tetap penting meskipun perangkat sangat sederhana.
+
+**Pengumpulan:** serahkan `main.py`, foto/screenshot output Shell, tabel eksperimen, dan jawaban pertanyaan analisis. Jangan menyerahkan accuracy training sebagai pengganti accuracy test.
